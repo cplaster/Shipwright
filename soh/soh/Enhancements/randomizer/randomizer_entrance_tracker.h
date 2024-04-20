@@ -85,6 +85,53 @@ s16 GetLastEntranceOverride();
 s16 GetCurrentGrottoId();
 const EntranceData* GetEntranceData(s16);
 
+typedef enum {
+    PATHNODE_TYPE_TARGET,
+    PATHNODE_TYPE_PROX,
+    PATHNODE_TYPE_TRANSIT,
+    PATHNODE_TYPE_ONEEXIT,
+    PATHNODE_TYPE_NOTSHUFFLED
+} PathNodeType;
+
+struct PathNode {
+    int entry;
+    int exit;
+    PathNodeType type;
+    std::vector<PathNode*> children;
+    PathNode* parent;
+
+    PathNode(const int entry, const int exit) : entry(entry), exit(exit) {
+    }
+};
+
+// Forward declare MapEntry
+struct MapEntry;
+
+// Define MapEntry with std::unordered_map
+typedef struct MapEntry {
+    // std::unordered_map<int, MapEntry*>* children;
+    int srcIndex;
+    int destIndex;
+    SpoilerEntranceGroup srcGroup;
+    SpoilerEntranceGroup destGroup;
+    std::string srcName;
+    std::string destName;
+    bool srcOneExit;
+    bool destOneExit;
+    SceneID srcScene;
+    SceneID destScene;
+    TrackerEntranceType entranceType;
+    PathNodeType nodeType;
+};
+
+typedef struct {
+    std::unordered_map<EntranceIndex, MapEntry*> entrances;
+    std::unordered_map<SceneID, std::unordered_set<EntranceIndex>> scenes;
+} WorldMap;
+
+WorldMap* CreateWorldMap();
+void TestPath(int targetIndex, PathNode* currentNode);
+
 class EntranceTrackerWindow : public LUS::GuiWindow {
   public:
     using GuiWindow::GuiWindow;

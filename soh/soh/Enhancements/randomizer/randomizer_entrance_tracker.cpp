@@ -1,8 +1,10 @@
 #include "randomizer_entrance_tracker.h"
 #include "soh/OTRGlobals.h"
 #include "soh/UIWidgets.hpp"
+#include "../../util.h"
 
 #include <map>
+#include <stack>
 #include <string>
 #include <vector>
 #include <libultraship/libultraship.h>
@@ -30,6 +32,16 @@ EntranceOverride destListSortedByArea[ENTRANCE_OVERRIDES_MAX_COUNT] = {0};
 EntranceOverride srcListSortedByType[ENTRANCE_OVERRIDES_MAX_COUNT] = {0};
 EntranceOverride destListSortedByType[ENTRANCE_OVERRIDES_MAX_COUNT] = {0};
 EntranceTrackingData gEntranceTrackingData = {0};
+
+// FIXME: cplaster Start Additions
+static ImVector<char> entranceTrackerNotes;
+uint32_t entranceTrackerNotesIdleFrames = 0;
+bool entranceTrackerNotesNeedSave = false;
+const uint32_t entranceTrackerNotesMaxIdleFrames =
+    40; // two seconds of game time, since OnGameFrameUpdate is used to tick
+int entranceTrackerSectionId;
+WorldMap* worldMap;
+// FIXME: End Additions
 
 static const EntranceOverride emptyOverride = {0};
 
@@ -639,6 +651,689 @@ void InitEntranceTrackingData() {
     SortEntranceListByType(destListSortedByType, 1);
 }
 
+// FIXME: cplaster Start Additions
+const EntranceData* GetEntranceOverrideData(s16 originalIndex) {
+    EntranceOverride* entranceList = srcListSortedByArea;
+    EntranceOverride entrance;
+    for (size_t i = 0; i < ENTRANCE_OVERRIDES_MAX_COUNT; i++) {
+        if (entranceList[i].index == originalIndex) {
+            entrance = entranceList[i];
+            break;
+        }
+    }
+
+    return GetEntranceData(entrance.override);
+}
+
+bool IsBadEntrance(s16 index) {
+
+    // There appear to be some bad entrances that cause problems probably because these entrances are not shuffled and
+    // thus not in the randomizer's dataset. These specifically are the left and right hand doors to the spirit temple,
+    // going down the gerudo river, and the dog lady's house.
+
+    if (index < 0) {
+        return true;
+    }
+
+    // spirit temple right hand
+    if (index == ENTR_SPIRIT_TEMPLE_2) {
+        return true;
+    }
+
+    // spirit temple left hand
+    if (index == ENTR_SPIRIT_TEMPLE_3) {
+        return true;
+    }
+
+    // lake hylia from gerudo valley
+    if (index == ENTR_LAKE_HYLIA_1) {
+        return true;
+    }
+
+    // dog lady's house
+    if (index == ENTR_DOG_LADY_HOUSE_0) {
+        return true;
+    }
+
+    return false;
+}
+
+class PathTree {
+  private:
+    PathNode* root;
+    std::unordered_set<s16> contents;
+
+  public:
+    PathTree() : root(nullptr) {
+    }
+    ~PathTree() {
+        deletePath(root);
+    }
+
+    void deletePath(PathNode* node) {
+        if (node == nullptr) {
+            return;
+        }
+
+        for (PathNode* child : node->children) {
+            deletePath(child);
+        }
+
+        contents.erase(node->entry);
+        delete node;
+    }
+
+    void addChild(PathNode* parent, const int entry, const int exit) {
+        PathNode* newNode = new PathNode(entry, exit);
+        addChild(parent, newNode);
+    }
+
+    void addChild(PathNode* parent, PathNode* child) {
+        child->parent = parent;
+        parent->children.push_back(child);
+        contents.insert(child->entry);
+    }
+
+    bool contains(s16 index) {
+        if (contents.find(index) != contents.end()) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    PathNode* getRoot() {
+        return root;
+    }
+
+    void setRoot(PathNode* node) {
+        root = node;
+        root->parent = nullptr;
+        // contents.insert(node->entry);
+    }
+
+    void removeEmptyNodes(PathNode* node) {
+        if (node == nullptr) {
+            return;
+        }
+
+        for (auto it = node->children.begin(); it != node->children.end();) {
+            if ((*it)->children.empty()) {
+                delete *it;
+                it = node->children.erase(it);
+            } else {
+                removeEmptyNodes(*it);
+                ++it;
+            }
+        }
+    }
+
+    void removeEmptyNodes() {
+        removeEmptyNodes(root);
+    }
+
+    void removeNonTargetNodes(PathNode* node) {
+        if (node == nullptr) {
+            return;
+        }
+
+        for (auto it = node->children.begin(); it != node->children.end();) {
+            if ((*it)->type != PATHNODE_TYPE_TARGET) {
+                removeNonTargetNodes(*it);
+                if ((*it)->children.empty()) {
+                    delete *it;
+                    it = node->children.erase(it);
+                } else {
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void removeNonTargetNodes() {
+        removeNonTargetNodes(root);
+    }
+
+    PathNode* findSmallestDepthTargetNode(PathNode* root) {
+        if (root == nullptr) {
+            return nullptr;
+        }
+
+        // Queue for BFS traversal
+        std::queue<std::pair<PathNode*, int>> q;
+        q.push({ root, 0 });
+
+        // Variables to track the smallest depth and the corresponding target node
+        int smallestDepth = std::numeric_limits<int>::max();
+        PathNode* smallestDepthTargetNode = nullptr;
+
+        while (!q.empty()) {
+            auto [node, depth] = q.front();
+            q.pop();
+
+            // If the current node is of type PATHNODE_TYPE_TARGET and has smaller depth, update the variables
+            if (node->type == PATHNODE_TYPE_TARGET && depth < smallestDepth) {
+                smallestDepth = depth;
+                smallestDepthTargetNode = node;
+            }
+
+            // Add children to the queue
+            for (PathNode* child : node->children) {
+                q.push({ child, depth + 1 });
+            }
+        }
+
+        return smallestDepthTargetNode;
+    }
+
+    void printTreeHierarchy(PathNode* node, std::string& out, WorldMap* worldMap, int depth) {
+        if (node == nullptr) {
+            return;
+        }
+
+        // Collect ancestors in a stack
+        std::stack<std::string> ancestorsStack;
+        PathNode* ancestor = node->parent;
+        int d = 0;
+        std::string s = "";
+
+        while (ancestor != nullptr) {
+            auto ancestorInfo = worldMap->entrances[(EntranceIndex)ancestor->entry];
+            ancestorsStack.push(ancestorInfo->srcName + " -> " + ancestorInfo->destName);
+            ancestor = ancestor->parent;
+        }
+
+        // Print ancestors in reverse order
+        while (!ancestorsStack.empty()) {
+            out += s + ancestorsStack.top() + "\n";
+            ancestorsStack.pop();
+            s += "\t";
+        }
+
+        // Print the current node
+        for (int i = 0; i < depth; ++i) {
+            out += "\t";
+        }
+
+        auto entryInfo = worldMap->entrances[(EntranceIndex)node->entry];
+        out += s + entryInfo->srcName + " -> " + entryInfo->destName + "\n\n";
+
+        // Recursively print children
+        for (PathNode* child : node->children) {
+            printTreeHierarchy(child, out, worldMap, depth + 1);
+        }
+    }
+
+    void printTreeHierarchy(std::string& out, WorldMap* worldMap) {
+        if (root != nullptr) {
+            root->parent = nullptr; // Ensure root node's parent is null
+            printTreeHierarchy(root, out, worldMap, 0);
+        }
+    }
+
+    std::vector<PathNode*> findTargetNodes(PathNode* node) {
+        std::vector<PathNode*> targetNodes;
+
+        // Base case: if node is nullptr, return empty vector
+        if (node == nullptr) {
+            return targetNodes;
+        }
+
+        // Check if current node is of type PATHNODE_TYPE_TARGET
+        if (node->type == PATHNODE_TYPE_TARGET) {
+            targetNodes.push_back(node);
+        }
+
+        // Recursively search for target nodes in children
+        for (PathNode* child : node->children) {
+            std::vector<PathNode*> childTargets = findTargetNodes(child);
+            targetNodes.insert(targetNodes.end(), childTargets.begin(), childTargets.end());
+        }
+
+        return targetNodes;
+    }
+
+    void printNodesWithAncestors(std::string& out, WorldMap* worldMap, const std::vector<PathNode*>& nodes) {
+        root->parent = nullptr;
+        for (PathNode* node : nodes) {
+            printTreeHierarchy(node, out, worldMap, 0);
+        }
+    }
+
+    bool compareByDepth(const PathNode* a, const PathNode* b) {
+        return getDepth(a) < getDepth(b);
+    }
+
+    int getDepth(const PathNode* node) const {
+        int depth = 0;
+
+        while (node->parent != nullptr) {
+            node = node->parent;
+            depth++;
+        }
+
+        return depth;
+    }
+
+    std::string splitString(const std::string& input, const std::string& delimiter) {
+        size_t pos = input.find(delimiter);
+        if (pos != std::string::npos) {
+            return input.substr(0, pos);
+        } else {
+            // If delimiter not found, return the input string as is
+            return input;
+        }
+    }
+
+    void truncateNodes(const std::vector<PathNode*>& nodes, WorldMap* worldMap) {
+        PathNode* r = getRoot();
+        int exit = r->exit;
+
+        for (PathNode* node : nodes) {
+            while (node->parent != nullptr) {
+                if (node->entry == exit) {
+                    // if the node's entry is the root node's exit, we can cut out any pathing in between
+                    node->parent = r;
+                    node = r;
+                } else if (node->exit == node->parent->entry) {
+                    // if we went into an entrance and turned around and went back through it, we can cut
+                    // out these steps
+                    PathNode* c = node->children[0];
+                    PathNode* g = node->parent->parent;
+                    g->children.clear();
+                    addChild(g, c);
+                    node = c;
+                } else {
+                    node = node->parent;
+                }
+            }
+        }
+
+        // this looks for cases where we are in the same scene somewhere up the chain. If so, we can cut out
+        // any pathing in between
+        for (PathNode* node : nodes) {
+            while (node->parent != nullptr) {
+                auto nt = splitString(worldMap->entrances[(EntranceIndex)node->entry]->srcName, " to ");
+                auto p = node->parent;
+                while (p->parent != nullptr) {
+                    auto pt = splitString(worldMap->entrances[(EntranceIndex)p->entry]->srcName, " to ");
+                    if (pt == nt) {
+                        auto gp = p->parent;
+                        gp->children.clear();
+                        addChild(gp, node);
+                        p = gp;
+                    } else {
+                        p = p->parent;
+                    }
+                }
+                node = node->parent;
+            }
+        }
+    }
+
+    void prettyPrint(std::string& out, WorldMap* worldMap) {
+        removeNonTargetNodes();
+        std::vector<PathNode*> targetNodes = findTargetNodes(root);
+        truncateNodes(targetNodes, worldMap);
+        std::sort(targetNodes.begin(), targetNodes.end(),
+                  [this](const PathNode* a, const PathNode* b) { return compareByDepth(a, b); });
+        printNodesWithAncestors(out, worldMap, targetNodes);
+    }
+
+    void print(std::string& out, WorldMap* worldMap, int depth = 0) {
+        print(out, worldMap, depth, root);
+    }
+
+    void print(std::string& out, WorldMap* worldMap, int depth, PathNode* node) {
+        if (node == nullptr) {
+            return;
+        }
+
+        std::string s = "";
+        for (int i = 0; i < depth; i++) {
+            s += "\t";
+        }
+
+        auto nodeInfo = worldMap->entrances[(EntranceIndex)node->entry];
+        out += s + nodeInfo->srcName + "->" + nodeInfo->destName + " :: " + std::to_string(node->type) + "\n";
+
+        for (PathNode* child : node->children) {
+            print(out, worldMap, depth + 1, child);
+        }
+    }
+};
+
+WorldMap* CreateWorldMap() {
+    EntranceOverride* entranceList = srcListSortedByArea;
+    std::unordered_map<EntranceIndex, MapEntry*> entrances;
+    std::unordered_map<SceneID, std::unordered_set<EntranceIndex>> scenes = {};
+    WorldMap* map = new WorldMap();
+
+    for (auto entrance : srcListSortedByArea) {
+        auto original = GetEntranceData(entrance.index);
+        auto override = GetEntranceData(entrance.override);
+        auto scenefix = GetEntranceData(override->reverseIndex);
+        MapEntry* node = new MapEntry();
+        node->srcIndex = original->index;
+        node->destIndex = override->reverseIndex;
+        node->srcGroup = (SpoilerEntranceGroup)original->srcGroup;
+        node->destGroup = (SpoilerEntranceGroup) override->dstGroup;
+        node->srcName = original->source + " to " + original->destination;
+        node->destName = override->destination + " from " + override->source;
+        node->srcOneExit = (original->oneExit == 1) ? true : false;
+        node->destOneExit = (override->oneExit == 1) ? true : false;
+        node->srcScene = (SceneID)original->scenes[0].scene;
+        // Scenes are always attached to the source, which isn't what we want for our destination
+        // The should be attached to destination, but they're not, so we have to do this.
+        // this doesn't work at all for song destinations, so we'll have to look at that later
+        if (!(scenefix == nullptr)) {
+            node->destScene = (SceneID)scenefix->scenes[0].scene;
+        } else {
+            // a valid scene doesn't exist, so just use a debug one for now
+            node->destScene = SCENE_TEST01;
+        }
+
+        node->nodeType = PATHNODE_TYPE_TRANSIT;
+        node->entranceType = (TrackerEntranceType)original->type;
+        entrances[(EntranceIndex)original->index] = node;
+        std::unordered_set<EntranceIndex>& sceneIndexes = scenes[(SceneID)original->scenes[0].scene];
+        sceneIndexes.insert((EntranceIndex)original->index);
+    }
+
+    map->entrances = entrances;
+    map->scenes = scenes;
+    return map;
+}
+
+PathTree* TestWorldMap(s16 targetIndex, WorldMap* worldMap, std::string& out, PathNode* currentNode = nullptr,
+                       PathTree* path = nullptr, int depth = 0) {
+    if (currentNode == nullptr) {
+        auto startLocation = worldMap->entrances[(EntranceIndex)lastEntranceIndex];
+        PathNode* currentNode = new PathNode(startLocation->srcIndex, startLocation->destIndex);
+        PathTree* path = new PathTree;
+        path->setRoot(currentNode);
+        TestWorldMap(targetIndex, worldMap, out, currentNode, path);
+        return path;
+    }
+
+    std::string s = "";
+
+    for (int i = 0; i < depth; i++) {
+        s += "\t";
+    }
+
+    depth++;
+
+    MapEntry* entrance = worldMap->entrances[(EntranceIndex)currentNode->entry];
+    std::unordered_set<EntranceIndex>& scene = worldMap->scenes[(SceneID)entrance->destScene];
+
+    for (auto it : scene) {
+
+        auto t = GetEntranceData(targetIndex);
+
+        // FIXME: warp pads (and probably a few other things) have a reverseIndex of -1, which won't work here
+        // so we'll just fire a continue for now
+        if (t->reverseIndex == -1) {
+            int i = 0;
+            continue;
+        }
+
+        // FIXME: Not sure this works right, need to playtest. These are just test values.
+        // Need to check why LOST_WOODS path isn't traversed to get to Kak
+        bool disc = IsEntranceDiscovered(it);
+        int gent = CVarGetInteger("gEntranceTrackerShowPathingSpoilers", 0);
+
+        // This will filter out paths with undiscovered entrances.
+        if (!IsEntranceDiscovered(it) && !CVarGetInteger("gEntranceTrackerShowPathingSpoilers", 0)) {
+            // out += s + "This entrance is not discovered: " + childEntrance->srcName + "\n";
+            continue;
+        }
+
+        MapEntry* target = worldMap->entrances[(EntranceIndex)t->reverseIndex];
+        MapEntry* childEntrance = worldMap->entrances[it];
+
+        // default to the transit type
+        PathNode* p = new PathNode(childEntrance->srcIndex, childEntrance->destIndex);
+        p->type = PATHNODE_TYPE_TRANSIT;
+
+        if (childEntrance->srcIndex == path->getRoot()->exit) {
+            out += s + "Trying: " + childEntrance->srcName + " -> " + childEntrance->destName + ":: ";
+            out += "BACKTRACK ROOT\n";
+            // continue;
+        }
+
+        if (childEntrance->destIndex == target->srcIndex) {
+            p->type = PATHNODE_TYPE_TARGET;
+            out += s + "Trying: " + childEntrance->srcName + " -> " + childEntrance->destName + ":: ";
+            out += "MATCH\n";
+            path->addChild(currentNode, p);
+            return path;
+        }
+
+        if (childEntrance->srcIndex == target->srcIndex) {
+            p->type = PATHNODE_TYPE_TARGET;
+            out += s + "Trying: " + childEntrance->srcName + ":: ";
+            out += "MATCH\n";
+            path->addChild(currentNode, p);
+            return path;
+        }
+
+        if (childEntrance->destOneExit) {
+            // out += "ONEEXIT\n";
+            continue;
+        }
+
+        if (path->contains(childEntrance->srcIndex) && !(childEntrance->srcIndex == path->getRoot()->exit)) {
+            out += s + "Trying: " + childEntrance->srcName + ":: ";
+            out += "VISITED\n";
+            continue;
+        }
+
+        out += s + "Trying: " + childEntrance->srcName + " -> " + childEntrance->destName + ":: ";
+        out += "TRANSIT\n";
+
+        path->addChild(currentNode, p);
+
+        TestWorldMap(targetIndex, worldMap, out, p, path, depth);
+    }
+}
+
+PathTree* TestWorldMapOLD_BUT_WORKS(s16 targetIndex, WorldMap* worldMap, std::string& out,
+                                    PathNode* currentNode = nullptr, PathTree* path = nullptr, int depth = 0) {
+
+    if (currentNode == nullptr) {
+        auto testdata = GetEntranceData(lastEntranceIndex);
+        auto testdata2 = GetEntranceData(testdata->reverseIndex);
+        auto startLocation = worldMap->entrances[(EntranceIndex)lastEntranceIndex];
+        PathNode* currentNode = new PathNode(startLocation->srcIndex, startLocation->destIndex);
+        PathTree* path = new PathTree;
+        path->setRoot(currentNode);
+        TestWorldMap(targetIndex, worldMap, out, currentNode, path);
+        return path;
+    }
+
+    std::string s = "";
+
+    for (int i = 0; i < depth; i++) {
+        s += "\t";
+    }
+
+    depth++;
+
+    MapEntry* entrance = worldMap->entrances[(EntranceIndex)currentNode->entry];
+    std::unordered_set<EntranceIndex>& scene = worldMap->scenes[(SceneID)entrance->destScene];
+
+    for (auto it : scene) {
+        MapEntry* childEntrance = worldMap->entrances[it];
+
+        // default to the transit type
+        PathNode* p = new PathNode(childEntrance->srcIndex, childEntrance->destIndex);
+        p->type = PATHNODE_TYPE_TRANSIT;
+
+        auto t = GetEntranceData(targetIndex);
+        MapEntry* target = worldMap->entrances[(EntranceIndex)t->reverseIndex];
+
+        // this entrance will at least get us to the same scene as the target
+        if (childEntrance->srcGroup == target->srcGroup) {
+            p->type = PATHNODE_TYPE_PROX;
+            // out += s + "Found proximity: " + childEntrance->srcName + "\n";
+            if (childEntrance->srcIndex == target->srcIndex) {
+                p->type = PATHNODE_TYPE_TARGET;
+                out += s + "Found target: " + childEntrance->srcName + "\n";
+            }
+        }
+
+        if (childEntrance->destOneExit == 1 && !(childEntrance->destIndex == target->srcIndex)) {
+            p->type = PATHNODE_TYPE_ONEEXIT;
+            // out += s + "Only has one entrance: " + childEntrance->srcName + " (" + childEntrance->destName + ") \n";
+            continue;
+        }
+
+        if (IsBadEntrance(childEntrance->srcIndex)) {
+            p->type = PATHNODE_TYPE_NOTSHUFFLED;
+            out += s + "This entrance doesn't get shuffled: " + childEntrance->srcName + "\n";
+            continue;
+        }
+
+        // This will filter out paths with undiscovered entrances.
+        if (!IsEntranceDiscovered(it) && !CVarGetInteger("gEntranceTrackerShowPathingSpoilers", 1)) {
+            // out += s + "This entrance is not discovered: " + childEntrance->srcName + "\n";
+            continue;
+        }
+
+        // we've already traversed the current entrance, we can skip it.
+        if (path->contains(it)) {
+            out += s + "Path already contains " + childEntrance->srcName + "\n";
+            continue;
+        }
+
+        // this is the entrance we just traversed, we can skip it.
+        if (childEntrance->destIndex == currentNode->entry) {
+            // out += s + "This entrance is the one we just came through: " + childEntrance->srcName + "\n";
+            continue;
+        }
+
+        path->addChild(currentNode, p);
+        out += s + "Trying: " + childEntrance->srcName + " -> " + childEntrance->destName + "\n";
+
+        TestWorldMap(targetIndex, worldMap, out, p, path, depth);
+    }
+}
+// FIXME: End Additions
+
+// FIXME: cplaster Start Additions
+void EntranceTrackerInitFile(bool isDebug) {
+    entranceTrackerNotes.clear();
+    entranceTrackerNotes.push_back(0);
+}
+
+void EntranceTrackerSaveFile(SaveContext* saveContext, int sectionID, bool fullSave) {
+    SaveManager::Instance->SaveData(
+        "personalEntranceNotes", std::string(std::begin(entranceTrackerNotes), std::end(entranceTrackerNotes)).c_str());
+}
+
+void EntranceTrackerLoadFile() {
+    std::string initialTrackerNotes = "";
+    SaveManager::Instance->LoadData("personalEntranceNotes", initialTrackerNotes);
+    entranceTrackerNotes.resize(initialTrackerNotes.length() + 1);
+    if (initialTrackerNotes != "") {
+        SohUtils::CopyStringToCharArray(entranceTrackerNotes.Data, initialTrackerNotes.c_str(),
+                                        entranceTrackerNotes.size());
+    } else {
+        entranceTrackerNotes.push_back(0);
+    }
+}
+
+bool IsValidEntranceTrackerSaveFile() {
+    bool validSave = gSaveContext.fileNum >= 0 && gSaveContext.fileNum <= 2;
+    return validSave;
+}
+
+void EntranceTrackerOnFrame() {
+    if (entranceTrackerNotesNeedSave && entranceTrackerNotesIdleFrames <= entranceTrackerNotesMaxIdleFrames) {
+        entranceTrackerNotesIdleFrames++;
+    }
+}
+
+void EntranceTrackerDrawNotes(bool resizeable = true) {
+    // ImGui::BeginGroup();
+    int iconSize = CVarGetInteger("gItemTrackerIconSize", 0);
+    int iconSpacing = CVarGetInteger("gItemTrackerIconSpacing", 0);
+
+    struct EntranceTrackerNotes {
+        static int EntranceTrackerNotesResizeCallback(ImGuiInputTextCallbackData* data) {
+            if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+                ImVector<char>* entranceTrackerNotes = (ImVector<char>*)data->UserData;
+                IM_ASSERT(entranceTrackerNotes->begin() == data->Buf);
+                entranceTrackerNotes->resize(
+                    data->BufSize); // NB: On resizing calls, generally data->BufSize == data->BufTextLen + 1
+                data->Buf = entranceTrackerNotes->begin();
+            }
+            return 0;
+        }
+        static bool EntranceTrackerNotesInputTextMultiline(const char* label, ImVector<char>* entranceTrackerNotes,
+                                                           const ImVec2& size = ImVec2(0, 0),
+                                                           ImGuiInputTextFlags flags = 0) {
+            IM_ASSERT((flags & ImGuiInputTextFlags_CallbackResize) == 0);
+            return ImGui::InputTextMultiline(label, entranceTrackerNotes->begin(), (size_t)entranceTrackerNotes->size(),
+                                             size, flags | ImGuiInputTextFlags_CallbackResize,
+                                             EntranceTrackerNotes::EntranceTrackerNotesResizeCallback,
+                                             (void*)entranceTrackerNotes);
+        }
+    };
+    ImVec2 size = resizeable ? ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y)
+                             : ImVec2(((iconSize + iconSpacing) * 6) - 8, 200);
+    if (EntranceTrackerNotes::EntranceTrackerNotesInputTextMultiline("##entranceTrackerNotes", &entranceTrackerNotes,
+                                                                     size, ImGuiInputTextFlags_AllowTabInput)) {
+        entranceTrackerNotesNeedSave = true;
+        entranceTrackerNotesIdleFrames = 0;
+    }
+    if ((ImGui::IsItemDeactivatedAfterEdit() ||
+         (entranceTrackerNotesNeedSave && entranceTrackerNotesIdleFrames > entranceTrackerNotesMaxIdleFrames)) &&
+        IsValidEntranceTrackerSaveFile()) {
+        entranceTrackerNotesNeedSave = false;
+        SaveManager::Instance->SaveSection(gSaveContext.fileNum, entranceTrackerSectionId, true);
+    }
+    // ImGui::EndGroup();
+}
+
+// Windowing stuff
+ImVec4 entranceTrackerChromaKeyBackground = { 0, 0, 0, 0 }; // Float value, 1 = 255 in rgb value.
+void BeginFloatingEntranceTrackerWindows(std::string UniqueName, ImGuiWindowFlags flags = 0) {
+    ImGuiWindowFlags windowFlags = flags;
+
+    // windowFlags |= ImGuiWindowFlags_AlwaysAutoResize;
+    // windowFlags |= ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoNav;
+
+    if (windowFlags == 0) {
+        windowFlags |= ImGuiWindowFlags_NoFocusOnAppearing;
+    }
+
+    if (CVarGetInteger("gEntranceTrackerWindowType", TRACKER_WINDOW_FLOATING) == TRACKER_WINDOW_FLOATING) {
+        // ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+        ImGui::SetNextWindowSize(ImVec2(600, 375), ImGuiCond_FirstUseEver);
+        /*
+        if (!CVarGetInteger("gEntranceTrackerHudEditMode", 0)) {
+            windowFlags |= ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove;
+        }
+        */
+    }
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, entranceTrackerChromaKeyBackground);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+    ImGui::Begin(UniqueName.c_str(), nullptr, windowFlags);
+}
+void EndFloatingEntranceTrackerWindows() {
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleColor();
+    ImGui::End();
+}
+
+// FIXME End Additions
+
 void EntranceTrackerWindow::DrawElement() {
     ImGui::SetNextWindowSize(ImVec2(600, 375), ImGuiCond_FirstUseEver);
 
@@ -915,6 +1610,37 @@ void EntranceTrackerWindow::DrawElement() {
                         ImGui::TextWrapped("%s", rplcDstName);
                     }
 
+                                        // FIXME: cplaster Start Additions
+                    ImGui::SameLine();
+                    ImGui::PushID(original->index);
+                    if (ImGui::Button("Find path")) {
+
+                        // make sure we only allow pathing to places we've visited.
+                        if (isDiscovered && !IsBadEntrance(lastEntranceIndex)) {
+                            std::string out = "";
+                            auto pathingStartData = GetEntranceOverrideData(lastEntranceIndex);
+                            auto pathingEndData = override;
+                            auto pathingStartName = pathingStartData->destination;
+                            auto pathingEndName = pathingEndData->destination;
+                            if (worldMap == nullptr) {
+                                worldMap = CreateWorldMap();
+                            }
+                            auto mypath = TestWorldMap(override->index, worldMap, out);
+
+                            out = "Pathing from " + pathingStartName + " to " + pathingEndName + "\n\n";
+                            mypath->prettyPrint(out, worldMap);
+                            entranceTrackerNotes.resize(out.length() + 1);
+                            if (out != "") {
+                                SohUtils::CopyStringToCharArray(entranceTrackerNotes.Data, out.c_str(),
+                                                                entranceTrackerNotes.size());
+                            } else {
+                                entranceTrackerNotes.push_back(0);
+                            }
+                        }
+                    }
+                    ImGui::PopID();
+                    // FIXME: End Additions
+
                     ImGui::PopStyleColor();
                 }
 
@@ -934,10 +1660,37 @@ void EntranceTrackerWindow::DrawElement() {
     ImGui::EndChild();
 
     ImGui::End();
+
+    // FIXME: cplaster Start Additions
+    BeginFloatingEntranceTrackerWindows("Entrance Tracker Pathing", 0);
+    EntranceTrackerDrawNotes(true);
+    EndFloatingEntranceTrackerWindows();
+    // FIXME: End Additions
+
 }
 
 void EntranceTrackerWindow::InitElement() {
     // Setup hooks for loading and clearing the entrance tracker data
+    //FIXME: cplaster Start Additions
+    float trackerBgR = CVarGetFloat("gItemTrackerBgColorR", 0);
+    float trackerBgG = CVarGetFloat("gItemTrackerBgColorG", 0);
+    float trackerBgB = CVarGetFloat("gItemTrackerBgColorB", 0);
+    float trackerBgA = CVarGetFloat("gItemTrackerBgColorA", 1);
+    entranceTrackerChromaKeyBackground = { trackerBgR, trackerBgG, trackerBgB,
+                                           trackerBgA }; // Float value, 1 = 255 in rgb value.
+    // Crashes when the itemTrackerNotes is empty, so add an empty character to it
+    if (entranceTrackerNotes.empty()) {
+        entranceTrackerNotes.push_back(0);
+    }
+
+    SaveManager::Instance->AddInitFunction(EntranceTrackerInitFile);
+    entranceTrackerSectionId =
+        SaveManager::Instance->AddSaveFunction("entranceTrackerData", 1, EntranceTrackerSaveFile, true, -1);
+    SaveManager::Instance->AddLoadFunction("entranceTrackerData", 1, EntranceTrackerLoadFile);
+
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGameFrameUpdate>(EntranceTrackerOnFrame);
+    //FIXME: End Additions
+
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t fileNum) {
         InitEntranceTrackingData();
     });
