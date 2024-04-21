@@ -802,10 +802,17 @@ bool EntranceShuffler::PlaceOtherImpasHouseEntrance(std::vector<Entrance*> entra
     for (Entrance* entrance : entrances) {
         // If the entrance is already connected or it doesn't have the same hint region as the already placed impas
         // house entrance, then don't try to use it
+        /*FIXME: cplaster: this logic seems to be broken...
         if (entrance->GetConnectedRegionKey() != RR_NONE ||
             (areaTable[otherImpaRegion].GetArea() != areaTable[entrance->GetParentRegionKey()].GetArea())) {
             continue;
         }
+        */
+        //FIXME: cplaster: We just do this instead.
+        if (entrance->GetConnectedRegionKey() != RR_NONE) {
+            continue;
+        }
+
         // If the placement succeeds, we return true
         if (ReplaceEntrance(entrance, otherImpaTarget, rollbacks)) {
             return true;
