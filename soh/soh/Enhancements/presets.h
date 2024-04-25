@@ -233,6 +233,8 @@ const std::vector<const char*> enhancementsCvars = {
     "gAuthenticLogo",
     "gPauseLiveLinkRotationSpeed",
     "gBowReticle",
+    "gBoomerangFirstPerson",
+    "gBoomerangReticle",
     "gFixTexturesOOB",
     "gIvanCoopModeEnabled",
     "gEnemySpawnsOverWaterboxes",
