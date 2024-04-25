@@ -11663,12 +11663,21 @@ void Player_Update(Actor* thisx, PlayState* play) {
         }
 
         if (CVarGetInteger("gEnableWalkModify", 0) && CVarGetInteger("gWalkSpeedToggle", 0)) {
+            /* FIXME: cplaster This fires from both modifier buttons. We're going to "borrow" BTN_MODIFIER1 to
+            * bind the age switch functionality below
             if (CHECK_BTN_ALL(sControlInput->press.button, BTN_MODIFIER1)) {
                 gWalkSpeedToggle1 = !gWalkSpeedToggle1;
             }
+            */
+
             if (CHECK_BTN_ALL(sControlInput->press.button, BTN_MODIFIER2)) {
                 gWalkSpeedToggle2 = !gWalkSpeedToggle2;
             }
+        }
+
+        // FIXME cplaster: binds the gSwitchAge functionality to the M1 button
+        if (CHECK_BTN_ALL(sControlInput->press.button, BTN_MODIFIER1)) {
+            CVarSetInteger("gSwitchAge", 1);
         }
 
         Player_UpdateCommon(this, play, &sp44);
