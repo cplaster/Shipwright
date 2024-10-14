@@ -1468,6 +1468,7 @@ void EntranceTrackerWindow::DrawElement() {
     auto groupNames = groupToggle ? groupTypeNames : spoilerEntranceGroupNames;
 
     EntranceOverride *entranceList;
+    static int idx = 0;
 
     switch (groupType) {
         case ENTRANCE_SOURCE_AREA:
@@ -1611,8 +1612,14 @@ void EntranceTrackerWindow::DrawElement() {
 
                     // Use a non-breaking space to keep the arrow from wrapping to a newline by itself
                     auto nbsp = u8"\u00A0";
+                    
+
                     if (original->srcGroup != ENTRANCE_GROUP_ONE_WAY) {
-                        if (!destToggle) ImGui::PushStyleColor(ImGuiCol_Text, COLOR_GRAY);  
+                        std::string rid = std::string("##") + std::to_string(original->index);
+                        ImGui::RadioButton(rid.c_str(), &idx, original->index);
+                        ImGui::SameLine();
+                        if (!destToggle) ImGui::PushStyleColor(ImGuiCol_Text, COLOR_GRAY); 
+
                         if (locationSearch.IsActive() || destToggle || !CVarGetInteger("gTrackers.EntranceTracker.SimplifyTo", 0)) {
                             ImGui::Text("%s", origSrcName);
                             ImGui::SameLine();
@@ -1620,12 +1627,16 @@ void EntranceTrackerWindow::DrawElement() {
                         if (!destToggle) ImGui::PopStyleColor();
                         
                         if (destToggle) ImGui::PushStyleColor(ImGuiCol_Text, COLOR_GRAY);
-                        if (locationSearch.IsActive() || !destToggle || !CVarGetInteger("gTrackers.EntranceTracker.SimplifyTo", 0))
+                        if (locationSearch.IsActive() || !destToggle || !CVarGetInteger("gTrackers.EntranceTracker.SimplifyTo", 0)) {
                             ImGui::Text("%s%s%s->", CVarGetInteger("gTrackers.EntranceTracker.SimplifyTo", 0) && !locationSearch.IsActive() ? "" : "to ", origDstName, nbsp);
-                        else
+                        } else {
                             ImGui::Text("->");
+                        }
                         if (destToggle) ImGui::PopStyleColor();
                     } else {
+                        std::string rid = std::string("##") + std::to_string(original->index);
+                        ImGui::RadioButton(rid.c_str(), &idx, original->index);
+                        ImGui::SameLine();
                         ImGui::Text("%s%s->", origSrcName, nbsp);
                     }
 
@@ -1658,7 +1669,7 @@ void EntranceTrackerWindow::DrawElement() {
                         if (isDiscovered && highlightDestinations) ImGui::PopStyleColor();
                     }
 
-                                        // FIXME: cplaster Start Additions
+                    // FIXME: cplaster Start Additions
                     ImGui::SameLine();
                     ImGui::PushID(original->index);
                     if (ImGui::Button("Find path")) {
